@@ -31,6 +31,8 @@ import io.questdb.log.LogFactory;
 import io.questdb.network.IOContext;
 import io.questdb.network.IODispatcher;
 import io.questdb.network.NetworkFacade;
+import io.questdb.std.IntHashSet;
+import io.questdb.std.IntIntHashMap;
 import io.questdb.std.Mutable;
 import io.questdb.std.Unsafe;
 import io.questdb.std.Vect;
@@ -68,6 +70,24 @@ class LineTcpConnectionContext implements IOContext, Mutable {
 
     @Override
     public void clear() {
+        if (nMeasurements > 0) {
+            long endNanoTime = System.nanoTime();
+            LOG.debug().$(System.identityHashCode(this)).$(": handleIO clear in ").$(Thread.currentThread().getName()).$();
+            for (int i = 0, k = threads.size(); i < k; i++) {
+                int t = threads.get(i);
+                int n = nRunByThread.get(t);
+                LOG.debug().$(System.identityHashCode(this)).$(": handleIO stats thread id").$(t).$(", n=").$(n).$();
+            }
+            LOG.debug().$(System.identityHashCode(this)).$(": handleIO stats nMeasurements=").$(nMeasurements).$(", wastedNs=").$(wastedNanoTime).$(", usefulNs=").$(usefulNanoTime)
+                    .$(", runNs=")
+                    .$(endNanoTime - firstMeasurementNanoTime).$();
+        }
+        nMeasurements = 0;
+        wastedNanoTime = 0;
+        usefulNanoTime = 0;
+        firstMeasurementNanoTime = 0;
+        threads.clear();
+        nRunByThread.clear();
         recvBufPos = recvBufStart;
         peerDisconnected = false;
         resetParser();
@@ -141,9 +161,37 @@ class LineTcpConnectionContext implements IOContext, Mutable {
         }
     }
 
+    private final IntIntHashMap nRunByThread = new IntIntHashMap();
+    private final IntHashSet threads = new IntHashSet();
+    private int nMeasurements = 0;
+    private long wastedNanoTime = 0;
+    private long usefulNanoTime = 0;
+    private long firstMeasurementNanoTime = 0;
+
     IOContextResult handleIO(NetworkIOJob netIoJob) {
+        int n = nRunByThread.get(netIoJob.getWorkerId());
+        if (n == -1) {
+            LOG.debug().$(System.identityHashCode(this)).$(": handleIO new thread ").$(Thread.currentThread().getName()).$(" workerId=").$(netIoJob.getWorkerId()).$(", fd=").$(fd)
+                    .$();
+            nRunByThread.put(netIoJob.getWorkerId(), 1);
+            threads.add(netIoJob.getWorkerId());
+        } else {
+            nRunByThread.put(netIoJob.getWorkerId(), n + 1);
+        }
+        n = nMeasurements;
+        long startNanoTime = System.nanoTime();
+        if (n == 0) {
+            firstMeasurementNanoTime = startNanoTime;
+        }
         read();
-        return parseMeasurements(netIoJob);
+        IOContextResult rc = parseMeasurements(netIoJob);
+        long endNanoTime = System.nanoTime();
+        if (n == nMeasurements) {
+            wastedNanoTime += endNanoTime - startNanoTime;
+        } else {
+            usefulNanoTime += endNanoTime - startNanoTime;
+        }
+        return rc;
     }
 
     protected final IOContextResult parseMeasurements(NetworkIOJob netIoJob) {
@@ -173,6 +221,7 @@ class LineTcpConnectionContext implements IOContext, Mutable {
                             recvBufPos = recvBufStart;
                             protoParser.of(recvBufStart);
                         }
+                        nMeasurements++;
                         continue;
                     }
 

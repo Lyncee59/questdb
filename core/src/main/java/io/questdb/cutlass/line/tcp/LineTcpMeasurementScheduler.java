@@ -792,8 +792,15 @@ class LineTcpMeasurementScheduler implements Closeable {
             }
         }
 
+        // TODO
         void handleWriterRelease() {
             if (null != writer) {
+                LOG.debug().$("writer release nMeasurements=").$(nMeasurements).$(", wastedNs=").$(wastedNanoTime).$(", usefulNs=").$(usefulNanoTime).$(", runToLastCommitMs=")
+                        .$(milliClock.getTicks() - firstMeasurementMillis).$();
+                firstMeasurementMillis = 0;
+                nMeasurements = 0;
+                wastedNanoTime = 0;
+                usefulNanoTime = 0;
                 LOG.debug().$("release commit [table=").$(writer.getTableName()).I$();
                 writer.commit();
                 writer = Misc.free(writer);
@@ -918,6 +925,12 @@ class LineTcpMeasurementScheduler implements Closeable {
         }
     }
 
+    // TODO
+    private long firstMeasurementMillis = 0;
+    private int nMeasurements = 0;
+    private long wastedNanoTime = 0;
+    private long usefulNanoTime = 0;
+
     private class WriterJob implements Job {
         private final int workerId;
         private final Sequence sequence;
@@ -972,47 +985,62 @@ class LineTcpMeasurementScheduler implements Closeable {
         }
 
         private boolean drainQueue() {
-            boolean busy = false;
-            while (true) {
-                long cursor;
-                while ((cursor = sequence.next()) < 0) {
-                    if (cursor == -1) {
-                        return busy;
+            int n = nMeasurements;
+            long startNanoTime = System.nanoTime();
+            if (n == 0) {
+                firstMeasurementMillis = milliClock.getTicks();
+            }
+            try {
+                boolean busy = false;
+                while (true) {
+                    long cursor;
+                    while ((cursor = sequence.next()) < 0) {
+                        if (cursor == -1) {
+                            return busy;
+                        }
+                    }
+                    busy = true;
+                    final LineTcpMeasurementEvent event = queue.get(cursor);
+                    boolean eventProcessed;
+                    if (event.threadId == workerId) {
+                        if (!event.tableUpdateDetails.assignedToJob) {
+                            assignedTables.add(event.tableUpdateDetails);
+                            event.tableUpdateDetails.assignedToJob = true;
+                            LOG.info().$("assigned table to writer thread [tableName=").$(event.tableUpdateDetails.tableName).$(", threadId=").$(workerId).$(']').$();
+                        }
+                        event.processMeasurementEvent(this);
+                        eventProcessed = true;
+                        nMeasurements++;
+                    } else {
+                        switch (event.threadId) {
+                            case REBALANCE_EVENT_ID:
+                                eventProcessed = processRebalance(event);
+                                break;
+
+                            case RELEASE_WRITER_EVENT_ID:
+                                eventProcessed = processReleaseWriter(event);
+                                break;
+
+                            default:
+                                eventProcessed = true;
+                                break;
+                        }
+                    }
+
+                    // by not releasing cursor we force the sequence to return us the same value over and over
+                    // until cursor value is released
+                    if (eventProcessed) {
+                        sequence.done(cursor);
+                    } else {
+                        return false;
                     }
                 }
-                busy = true;
-                final LineTcpMeasurementEvent event = queue.get(cursor);
-                boolean eventProcessed;
-                if (event.threadId == workerId) {
-                    if (!event.tableUpdateDetails.assignedToJob) {
-                        assignedTables.add(event.tableUpdateDetails);
-                        event.tableUpdateDetails.assignedToJob = true;
-                        LOG.info().$("assigned table to writer thread [tableName=").$(event.tableUpdateDetails.tableName).$(", threadId=").$(workerId).$(']').$();
-                    }
-                    event.processMeasurementEvent(this);
-                    eventProcessed = true;
+            } finally {
+                long endNanoTime = System.nanoTime();
+                if (n == nMeasurements) {
+                    wastedNanoTime += endNanoTime - startNanoTime;
                 } else {
-                    switch (event.threadId) {
-                        case REBALANCE_EVENT_ID:
-                            eventProcessed = processRebalance(event);
-                            break;
-
-                        case RELEASE_WRITER_EVENT_ID:
-                            eventProcessed = processReleaseWriter(event);
-                            break;
-
-                        default:
-                            eventProcessed = true;
-                            break;
-                    }
-                }
-
-                // by not releasing cursor we force the sequence to return us the same value over and over
-                // until cursor value is released
-                if (eventProcessed) {
-                    sequence.done(cursor);
-                } else {
-                    return false;
+                    usefulNanoTime += endNanoTime - startNanoTime;
                 }
             }
         }
@@ -1126,11 +1154,11 @@ class LineTcpMeasurementScheduler implements Closeable {
             while (busyContexts.size() > 0) {
                 LineTcpConnectionContext busyContext = busyContexts.getQuick(0);
                 if (handleIO(busyContext)) {
-                    break;
+                    return false;
                 }
                 LOG.debug().$("context is no longer waiting on a full queue [fd=").$(busyContext.getFd()).$(']').$();
                 busyContexts.remove(0);
-                busy = true;
+                return true;
             }
 
             if (dispatcher.processIOQueue(onRequest)) {
